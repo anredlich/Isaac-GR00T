@@ -150,6 +150,35 @@ def parse_action_gr00t(action: dict[str, Any]) -> dict[str, Any]:
     # Unbatch and add prefix
     return {f"action.{key}": action[key][0] for key in action}
 
+def analyze_action_deltas(pred_actions_per_chunk: list[np.ndarray]) -> None:
+    """Print step-to-step deltas within chunks and discontinuities at chunk boundaries."""
+    # Within-chunk deltas (consecutive predictions inside a single chunk)
+    within_chunk_deltas = []
+    for chunk in pred_actions_per_chunk:
+        deltas = np.abs(np.diff(chunk, axis=0))  # shape (H-1, D)
+        within_chunk_deltas.append(deltas)
+    within = np.concatenate(within_chunk_deltas, axis=0)
+
+    logging.info("=" * 60)
+    logging.info("WITHIN-CHUNK action deltas (step-to-step inside a chunk)")
+    logging.info(f"  Max per joint:         {within.max(axis=0)}")
+    logging.info(f"  99th pctile per joint: {np.percentile(within, 99, axis=0)}")
+    logging.info(f"  Median per joint:      {np.median(within, axis=0)}")
+    logging.info(f"  Overall max:           {within.max():.4f}")
+
+    # Between-chunk deltas (last action of chunk N vs first action of chunk N+1)
+    if len(pred_actions_per_chunk) > 1:
+        between = []
+        for i in range(len(pred_actions_per_chunk) - 1):
+            last_action = pred_actions_per_chunk[i][-1]
+            first_next = pred_actions_per_chunk[i + 1][0]
+            between.append(np.abs(first_next - last_action))
+        between = np.array(between)
+        logging.info("BETWEEN-CHUNK action deltas (chunk_N[-1] vs chunk_{N+1}[0])")
+        logging.info(f"  Max per joint:         {between.max(axis=0)}")
+        logging.info(f"  Mean per joint:        {between.mean(axis=0)}")
+        logging.info(f"  Overall max:           {between.max():.4f}")
+    logging.info("=" * 60)
 
 def evaluate_single_trajectory(
     policy: BasePolicy,
@@ -160,6 +189,10 @@ def evaluate_single_trajectory(
     steps=300,
     action_horizon=16,
     save_plot_path=None,
+    use_rtc=False,
+    rtc_overlap_steps=4,
+    rtc_frozen_steps=2,
+    rtc_ramp_rate=10.0,
 ):
     # Ensure steps doesn't exceed trajectory length
     traj = loader[traj_id]
@@ -170,6 +203,8 @@ def evaluate_single_trajectory(
     )
 
     pred_action_across_time = []
+    prev_normalized_chunk = None  # for RTC
+    pred_actions_per_chunk = []  # track each chunk as a (H, D) array for delta analysis
 
     # Extract state and action keys separately and sort for consistent order
     state_keys = loader.modality_configs["state"].modality_keys
@@ -190,8 +225,22 @@ def evaluate_single_trajectory(
         for language_key in loader.modality_configs["language"].modality_keys:
             obs[language_key] = data_point.text
         parsed_obs = parse_observation_gr00t(obs, loader.modality_configs)
-        _action_chunk, _ = policy.get_action(parsed_obs)
+        rtc_opts = None
+        if use_rtc and prev_normalized_chunk is not None:
+            rtc_opts = {
+                "previous_action_chunk": prev_normalized_chunk,
+                "action_horizon": action_horizon,
+                "rtc_overlap_steps": rtc_overlap_steps,
+                "rtc_frozen_steps": rtc_frozen_steps,
+                "rtc_ramp_rate": rtc_ramp_rate,
+            }
+        #_action_chunk, _ = policy.get_action(parsed_obs)
+        _action_chunk, info = policy.get_action(parsed_obs, options=rtc_opts)
         action_chunk = parse_action_gr00t(_action_chunk)
+        # Save normalized chunk for next iteration's RTC
+        if use_rtc and isinstance(info, dict) and "normalized_action" in info:
+            prev_normalized_chunk = info["normalized_action"]        
+        this_chunk_actions = []
         for j in range(action_horizon):
             # NOTE: concat_pred_action = action[f"action.{modality_keys[0]}"][j]
             # the np.atleast_1d is to ensure the action is a 1D array, handle where single value is returned
@@ -203,6 +252,8 @@ def evaluate_single_trajectory(
                 axis=0,
             )
             pred_action_across_time.append(concat_pred_action)
+            this_chunk_actions.append(concat_pred_action)
+        pred_actions_per_chunk.append(np.array(this_chunk_actions))
 
     def extract_state_joints(traj: pd.DataFrame, columns: list[str]):
         np_dict = {}
@@ -229,6 +280,8 @@ def evaluate_single_trajectory(
     logging.info(f"state_joints vs time {state_joints_across_time.shape}")
     logging.info(f"gt_action_joints vs time {gt_action_across_time.shape}")
     logging.info(f"pred_action_joints vs time {pred_action_across_time.shape}")
+
+    analyze_action_deltas(pred_actions_per_chunk)
 
     # Plot trajectory results
     plot_trajectory_results(
@@ -276,6 +329,18 @@ class ArgsConfig:
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
+    use_rtc: bool = False
+    """Enable Real-Time Chunking (RTC) for smoother action transitions."""
+
+    rtc_overlap_steps: int = 4
+    """Number of overlap steps for RTC (must be <= action_horizon)."""
+
+    rtc_frozen_steps: int = 2
+    """Number of frozen steps for RTC (must be <= rtc_overlap_steps)."""
+
+    rtc_ramp_rate: float = 10.0
+    """Ramp rate for RTC (typical 5-15)."""
+    
     save_plot_path: str | None = None
     """Path to save the plot to."""
 
@@ -351,6 +416,10 @@ def main(args: ArgsConfig):
             steps=args.steps,
             action_horizon=args.action_horizon,
             save_plot_path=args.save_plot_path,
+            use_rtc=args.use_rtc,
+            rtc_overlap_steps=args.rtc_overlap_steps,
+            rtc_frozen_steps=args.rtc_frozen_steps,
+            rtc_ramp_rate=args.rtc_ramp_rate,
         )
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)

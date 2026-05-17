@@ -382,7 +382,14 @@ class Gr00tPolicy(BasePolicy):
 
         Args:
             observation: Batched observation dictionary
-            options: Optional parameters (currently unused)
+            options: Optional parameters. May contain RTC settings:
+                - previous_action_chunk: numpy array or tensor (B, T, D) of normalized previous chunk
+                - action_horizon: int
+                - rtc_overlap_steps: int (e.g., 4 of 16)
+                - rtc_frozen_steps: int (e.g., 2 of 16)
+                - rtc_ramp_rate: float (e.g., 10.0)
+        Note: When RTC is used, the returned info dict contains 'normalized_action'
+        which should be passed back as options["previous_action_chunk"] on the next call.
 
         Returns:
             Tuple of (actions_dict, info_dict)
@@ -403,9 +410,29 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = self.collate_fn(processed_inputs)
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
+        # RTC: if previous normalized chunk is provided in options, inject for inpainting
+        rtc_options = None
+        if options is not None and options.get("previous_action_chunk") is not None:
+            prev_chunk = options["previous_action_chunk"]
+            if not isinstance(prev_chunk, torch.Tensor):
+                prev_chunk = torch.as_tensor(prev_chunk)
+            prev_chunk = prev_chunk.to(
+                device=collated_inputs["inputs"]["embodiment_id"].device,
+                dtype=torch.bfloat16,
+            )
+            # Inject the previous chunk so it routes through prepare_input into action_inputs
+            collated_inputs["inputs"]["action"] = prev_chunk
+            rtc_options = {
+                "action_horizon": options["action_horizon"],
+                "rtc_overlap_steps": options["rtc_overlap_steps"],
+                "rtc_frozen_steps": options["rtc_frozen_steps"],
+                "rtc_ramp_rate": options["rtc_ramp_rate"],
+            }
+
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            #model_pred = self.model.get_action(**collated_inputs)
+            model_pred = self.model.get_action(**collated_inputs, options=rtc_options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
@@ -420,7 +447,9 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        info = {"normalized_action": normalized_action.detach().cpu().numpy()}
+        return casted_action, info
+        #return casted_action, {}
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.
