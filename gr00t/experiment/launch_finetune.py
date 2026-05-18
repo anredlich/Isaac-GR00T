@@ -16,6 +16,17 @@
 # Launch finetuning for N1.7 on "single node".
 # This script tries to provide a similar user experience as current OSS.
 
+# Compatibility patch for torch 2.6+ weights_only=True default breaking
+# HuggingFace Trainer's RNG state loading from older checkpoints.
+# Safe because we only load checkpoints we created ourselves.
+import torch as _torch_compat
+_orig_torch_load = _torch_compat.load
+def _patched_torch_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _orig_torch_load(*args, **kwargs)
+_torch_compat.load = _patched_torch_load
+
 import json
 import os
 from pathlib import Path
