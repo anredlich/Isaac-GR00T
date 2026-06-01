@@ -212,6 +212,7 @@ def evaluate_single_trajectory(
         loader.modality_configs["action"].modality_keys if modality_keys is None else modality_keys
     )
 
+    inference_times_ms = []
     modality_configs = deepcopy(loader.modality_configs)
     modality_configs.pop("action")
     for step_count in range(0, actual_steps, action_horizon):
@@ -235,7 +236,12 @@ def evaluate_single_trajectory(
                 "rtc_ramp_rate": rtc_ramp_rate,
             }
         #_action_chunk, _ = policy.get_action(parsed_obs)
+        import time as _time
+        _t0 = _time.perf_counter()
         _action_chunk, info = policy.get_action(parsed_obs, options=rtc_opts)
+        _t_inf_ms = (_time.perf_counter() - _t0) * 1000
+        inference_times_ms.append(_t_inf_ms)
+        logging.info(f"  inference: {_t_inf_ms:.1f} ms")
         action_chunk = parse_action_gr00t(_action_chunk)
         # Save normalized chunk for next iteration's RTC
         if use_rtc and isinstance(info, dict) and "normalized_action" in info:
@@ -274,6 +280,18 @@ def evaluate_single_trajectory(
     # calc MSE and MAE across time
     mse = np.mean((gt_action_across_time - pred_action_across_time) ** 2)
     mae = np.mean(np.abs(gt_action_across_time - pred_action_across_time))
+    # Inference timing summary
+    if inference_times_ms:
+        _arr = np.array(inference_times_ms)
+        logging.info("=" * 60)
+        logging.info(f"INFERENCE TIMING ({len(_arr)} calls)")
+        logging.info(f"  Mean:   {_arr.mean():.1f} ms")
+        logging.info(f"  Median: {np.median(_arr):.1f} ms")
+        logging.info(f"  Min:    {_arr.min():.1f} ms  (first call is usually slow warmup)")
+        logging.info(f"  Max:    {_arr.max():.1f} ms")
+        logging.info(f"  P95:    {np.percentile(_arr, 95):.1f} ms")
+        logging.info(f"  Excluding 1st: mean={_arr[1:].mean():.1f} ms, median={np.median(_arr[1:]):.1f} ms")
+        logging.info("=" * 60)
     logging.info(f"Unnormalized Action MSE across single traj: {mse}")
     logging.info(f"Unnormalized Action MAE across single traj: {mae}")
 

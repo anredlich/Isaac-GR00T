@@ -170,6 +170,78 @@ class TrossenGR00TBridge:
         else:
             logger.error(f"Unknown mode: {self.test_mode}. No action executed.")
 
+    def _log_chunk_diagnostics(self, prev_chunk_for_diag, joint_positions):
+        """Log RTC freeze/ramp/free-region checks, boundary jerk, and first-action delta.
+
+        Time alignment between old and new chunks:
+            new_chunk[i] corresponds in time to prev_chunk[OLH + i]
+        because the old chunk was executed for OLH steps before replanning.
+        """
+        if self.use_rtc and prev_chunk_for_diag is not None:
+            olh = self.open_loop_horizon
+            n_frozen = self.rtc_frozen_steps
+            n_overlap = self.rtc_overlap_steps
+            prev_len = len(prev_chunk_for_diag)
+            new_len = len(self.current_action_chunk)
+
+            # --- Frozen region: should be nearly identical (RTC server enforces) ---
+            frozen_end_prev = min(olh + n_frozen, prev_len)
+            frozen_count = max(0, frozen_end_prev - olh)
+            if frozen_count > 0:
+                frozen_new = self.current_action_chunk[:frozen_count]
+                frozen_prev = prev_chunk_for_diag[olh:olh + frozen_count]
+                frozen_max = np.abs(frozen_new - frozen_prev).max()
+                diag.info(
+                    f"RTC frozen[0:{frozen_count}] vs prev[{olh}:{olh + frozen_count}]: "
+                    f"max diff = {frozen_max:.4f} (expect ~0)"
+                )
+
+            # --- Ramp region: blended, should diverge gradually ---
+            ramp_end_prev = min(olh + n_overlap, prev_len)
+            ramp_start = n_frozen
+            ramp_end_new = min(n_overlap, new_len)
+            if ramp_end_new > ramp_start and ramp_end_prev > olh + ramp_start:
+                ramp_count = min(ramp_end_new - ramp_start,
+                                 ramp_end_prev - (olh + ramp_start))
+                ramp_new = self.current_action_chunk[ramp_start:ramp_start + ramp_count]
+                ramp_prev = prev_chunk_for_diag[olh + ramp_start:olh + ramp_start + ramp_count]
+                ramp_max = np.abs(ramp_new - ramp_prev).max()
+                diag.info(
+                    f"RTC ramp[{ramp_start}:{ramp_start + ramp_count}] vs "
+                    f"prev[{olh + ramp_start}:{olh + ramp_start + ramp_count}]: "
+                    f"max diff = {ramp_max:.4f} (expect small, growing)"
+                )
+
+            # --- Free region: outside overlap, no RTC constraint ---
+            free_idx_new = n_overlap + max(0, (new_len - n_overlap) // 2)
+            free_idx_prev = olh + free_idx_new
+            if free_idx_new < new_len and free_idx_prev < prev_len:
+                free_diff = np.abs(
+                    self.current_action_chunk[free_idx_new]
+                    - prev_chunk_for_diag[free_idx_prev]
+                ).max()
+                diag.info(
+                    f"RTC free new[{free_idx_new}] vs prev[{free_idx_prev}]: "
+                    f"max diff = {free_diff:.4f} (expect larger - policy free here)"
+                )
+
+            # --- Boundary continuity: actual physical discontinuity at handoff ---
+            if olh - 1 < prev_len:
+                boundary = np.abs(
+                    self.current_action_chunk[0] - prev_chunk_for_diag[olh - 1]
+                )
+                diag.info(
+                    f"Boundary jerk: |new[0] - prev[{olh - 1}]| "
+                    f"max={boundary.max():.4f} rad on joint {boundary.argmax()}"
+                )
+
+        first_action = self.current_action_chunk[0]
+        initial_delta = np.abs(first_action - joint_positions)
+        diag.info(
+            f"First action delta from current state: "
+            f"max={initial_delta.max():.4f} rad on joint {initial_delta.argmax()}"
+        )
+
     def build_gr00t_observation(self, joint_positions: np.ndarray,
                                  observation_dict: dict, task_prompt: str) -> dict:
         """
@@ -323,16 +395,19 @@ class TrossenGR00TBridge:
                     _, info = response
                     if isinstance(info, dict) and "normalized_action" in info:
                         self.prev_normalized_chunk = info["normalized_action"]
-                # DIAGNOSTIC: RTC freeze check and first-action delta (only when diagnostics enabled)
+                # # DIAGNOSTIC: RTC freeze check and first-action delta (only when diagnostics enabled)
+                # if diag.isEnabledFor(logging.INFO):
+                #     if self.use_rtc and prev_chunk_for_diag is not None:
+                #         diff_0 = np.abs(self.current_action_chunk[0] - prev_chunk_for_diag[12]).max()
+                #         diff_1 = np.abs(self.current_action_chunk[1] - prev_chunk_for_diag[13]).max()
+                #         diff_random = np.abs(self.current_action_chunk[8] - prev_chunk_for_diag[8]).max()
+                #         diag.info(f"RTC freeze: new[0] vs prev[12] = {diff_0:.4f}, new[1] vs prev[13] = {diff_1:.4f}, new[8] vs prev[8] = {diff_random:.4f}")
+                #     first_action = self.current_action_chunk[0]
+                #     initial_delta = np.abs(first_action - joint_positions)
+                #     diag.info(f"First action delta from current state: max={initial_delta.max():.4f} rad on joint {initial_delta.argmax()}")
+                # DIAGNOSTIC: RTC freeze/ramp/free-region checks and boundary continuity
                 if diag.isEnabledFor(logging.INFO):
-                    if self.use_rtc and prev_chunk_for_diag is not None:
-                        diff_0 = np.abs(self.current_action_chunk[0] - prev_chunk_for_diag[12]).max()
-                        diff_1 = np.abs(self.current_action_chunk[1] - prev_chunk_for_diag[13]).max()
-                        diff_random = np.abs(self.current_action_chunk[8] - prev_chunk_for_diag[8]).max()
-                        diag.info(f"RTC freeze: new[0] vs prev[12] = {diff_0:.4f}, new[1] vs prev[13] = {diff_1:.4f}, new[8] vs prev[8] = {diff_random:.4f}")
-                    first_action = self.current_action_chunk[0]
-                    initial_delta = np.abs(first_action - joint_positions)
-                    diag.info(f"First action delta from current state: max={initial_delta.max():.4f} rad on joint {initial_delta.argmax()}")
+                    self._log_chunk_diagnostics(prev_chunk_for_diag, joint_positions)
                 self.action_chunk_idx = 0
 
             # Select current action from chunk
