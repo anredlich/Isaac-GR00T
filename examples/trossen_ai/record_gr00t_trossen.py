@@ -37,6 +37,10 @@ from scipy.interpolate import PchipInterpolator
 from utils import init_keyboard_listener, say_tts
 import os
 
+# Additional imports for recording and intervention (from openpi record.py)
+import trossen_arm as trossen
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -65,6 +69,7 @@ class TrossenGR00TBridge:
         rtc_frozen_steps: int = 2,
         rtc_ramp_rate: float = 15.0,
         action_smooth_alpha: float = 1.0,
+        record_mode: str = "rollout",
     ):        
         """
         ...
@@ -99,14 +104,27 @@ class TrossenGR00TBridge:
         logger.info(f"  Action keys: {self.modality_config['action'].modality_keys}")
         logger.info(f"  Action horizon: {len(self.modality_config['action'].delta_indices)}")
 
-        # Initialize trossen robot (same as openpi version)
+        # Initialize trossen robot
         robot_config = TrossenAIStationaryRobotConfig(
             max_relative_target,
             home_pose=[0, 0.261799, 0.261799, 0, 0, 0, 0.044]
         )
         self.robot = make_robot_from_config(robot_config)
-        self.robot.leader_arms = {}
-        self.robot.connect()
+
+        # Capture dataset features BEFORE clearing leader_arms
+        self.dataset_features = self.robot.features.copy()
+        for key, ft in self.dataset_features.items():
+            if 'images' in key:
+                self.dataset_features[key] = {'dtype': 'video', **ft}
+
+        self.record_mode = record_mode
+        if record_mode == 'rollout':
+            self.robot.leader_arms = {}
+
+        self.robot.connect(hold=True)
+
+        # Save CLI clamp value so we can restore after teleop/intervention phases
+        self._cli_max_relative_target = max_relative_target
 
         self.current_action_chunk = None
         self.action_chunk_idx = 0
@@ -148,7 +166,7 @@ class TrossenGR00TBridge:
         }
 
     def execute_action(self, action: np.ndarray):
-        """Execute action on the arm."""
+        """Execute action on the arm and return the actually-executed action (post-EMA)."""
 
         # Low-pass filter on commanded actions
         if self._last_action is None:
@@ -158,17 +176,17 @@ class TrossenGR00TBridge:
             smoothed = alpha * action + (1.0 - alpha) * self._last_action
         self._last_action = smoothed.copy()
 
-        #full_action = action.copy()
-        full_action = smoothed.copy()
-        full_action = torch.from_numpy(full_action).float()
+        full_action = torch.from_numpy(smoothed.copy()).float()
 
         if self.test_mode == "test":
             logger.info(f"TEST MODE: Would execute action: {full_action}")
-            return
+            return full_action
         if self.test_mode == "autonomous":
             self.robot.send_action(full_action)
+            return full_action
         else:
             logger.error(f"Unknown mode: {self.test_mode}. No action executed.")
+            return full_action
 
     def _log_chunk_diagnostics(self, prev_chunk_for_diag, joint_positions):
         """Log RTC freeze/ramp/free-region checks, boundary jerk, and first-action delta.
@@ -319,8 +337,9 @@ class TrossenGR00TBridge:
             positions = interpolator_position(current_time)
             self.execute_action(positions)
 
-    def run_episode(self, task_prompt: str = "transfer the cube"):
-        """Run a single episode of policy execution."""
+    def run_episode_rollout(self, task_prompt: str = "transfer the cube",
+                            dataset=None, events=None):
+        """Run a single episode of policy execution, optionally recording to a dataset."""        
         self.episode_step = 0
         self.action_chunk_idx = 0
         self.current_action_chunk = None
@@ -328,8 +347,12 @@ class TrossenGR00TBridge:
         self._last_action = None  # reset action filter per episode
         self.is_running = True
 
-        listener, events = init_keyboard_listener()
-
+        # events comes from autonomous_mode's shared listener; fallback if not passed
+        if events is None:
+            events = {"exit_early": False, "rerecord_episode": False,
+                      "stop_recording": False,
+                      "switch_to_teleop": False, "switch_to_rollout": False}
+            
         camera_features = list(self.robot.camera_features.keys())
         for cam in camera_features:
             cv2.namedWindow(cam, cv2.WINDOW_NORMAL)
@@ -380,14 +403,14 @@ class TrossenGR00TBridge:
                     diag.info(f"RTC active: prev_chunk shape={self.prev_normalized_chunk.shape}")
                 elif self.use_rtc:
                     diag.info("RTC enabled but no previous chunk yet (first inference)")
-                #else:
-                #    diag.info("RTC disabled")
+                else:
+                    diag.info("RTC disabled")
                 
                 # Send to server and get action chunk
                 server_start = time.time()
                 response = self.policy_client.get_action(gr00t_obs, options=rtc_opts)
                 server_time_ms = (time.time() - server_start) * 1000
-                #logger.info(f"Server inference: {server_time_ms:.1f} ms")
+                logger.info(f"Server inference: {server_time_ms:.1f} ms")
 
                 # Parse response into (chunk_size, 14) array AND save normalized chunk for RTC
                 self.current_action_chunk = self.parse_gr00t_action(response)
@@ -406,8 +429,8 @@ class TrossenGR00TBridge:
                 #     initial_delta = np.abs(first_action - joint_positions)
                 #     diag.info(f"First action delta from current state: max={initial_delta.max():.4f} rad on joint {initial_delta.argmax()}")
                 # DIAGNOSTIC: RTC freeze/ramp/free-region checks and boundary continuity
-                #if diag.isEnabledFor(logging.INFO):
-                #    self._log_chunk_diagnostics(prev_chunk_for_diag, joint_positions)
+                if diag.isEnabledFor(logging.INFO):
+                    self._log_chunk_diagnostics(prev_chunk_for_diag, joint_positions)
                 self.action_chunk_idx = 0
 
             # Select current action from chunk
@@ -420,8 +443,18 @@ class TrossenGR00TBridge:
                 a_t[8] = a_t[8] - 0.025
                 a_t[9] = a_t[9] + 0.025
 
-            # Execute the action
-            self.execute_action(a_t)
+            # Execute the action and get the actually-executed action for recording
+            actual_action = self.execute_action(a_t)
+
+            # Record frame if recording
+            if dataset is not None:
+                obs = self.robot.capture_observation()
+                frame = {
+                    **obs,
+                    "action": actual_action,
+                    "task": task_prompt,
+                }
+                dataset.add_frame(frame)
 
             self.action_chunk_idx += 1
             self.episode_step += 1
@@ -440,16 +473,346 @@ class TrossenGR00TBridge:
         self.is_running = False
         logger.info(f"Episode completed after {self.episode_step} steps")
 
-    def autonomous_mode(self, task_prompt: str = "transfer the cube"):
-        """Run in autonomous mode where the arm executes policy predictions."""
-        logger.info("Starting autonomous mode")
-        self.run_episode(task_prompt=task_prompt)
+    def run_episode_teleoperate(self, task_prompt: str = "transfer the cube",
+                                dataset=None, events=None):
+        """Run a single episode of pure teleoperation, optionally recording to a dataset."""
+        self.episode_step = 0
+        self.is_running = True
+
+        if events is None:
+            events = {"exit_early": False, "rerecord_episode": False,
+                      "stop_recording": False,
+                      "switch_to_teleop": False, "switch_to_rollout": False}
+
+        camera_features = list(self.robot.camera_features.keys())
+        for cam in camera_features:
+            cv2.namedWindow(cam, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(cam, 640, 480)
+
+        logger.info(f"Starting teleop episode with prompt: '{task_prompt}'")
+        say_tts('starting teleop episode')
+        time.sleep(2)
+
+        # Disable clamping for teleop — human motion is inherently smooth
+        self._set_max_relative_target(None)
+        try:
+
+            while self.is_running and self.episode_step < self.max_steps:
+                start_loop_time = time.perf_counter()
+
+                # Display cameras live
+                if self.display:
+                    observation_dict = self.robot.capture_observation()
+                    for cam in camera_features:
+                        image_hwc = observation_dict[cam].numpy()
+                        cv2.imshow(cam, cv2.cvtColor(image_hwc, cv2.COLOR_RGB2BGR))
+                        cv2.waitKey(1)
+
+                # One teleop step: reads leaders, sends to followers, returns obs + action
+                observation, action = self.robot.teleop_step(record_data=True)
+
+                if dataset is not None:
+                    frame = {
+                        **observation,
+                        "action": action["action"],
+                        "task": task_prompt,
+                    }
+                    dataset.add_frame(frame)
+
+                self.episode_step += 1
+
+                # Maintain control frequency
+                dt_s = time.perf_counter() - start_loop_time
+                busy_wait_time = self.dt - dt_s
+                if busy_wait_time > 0:
+                    time.sleep(busy_wait_time)
+
+                if events["exit_early"]:
+                    events["exit_early"] = False
+                    break
+        finally:
+            self.restore_max_relative_target()
+
+        self.is_running = False
+        logger.info(f"Teleop episode completed after {self.episode_step} steps")
+
+    def run_episode_intervention(self, task_prompt: str = "transfer the cube",
+                                 dataset=None, events=None):
+        """Run a policy episode with keyboard-triggered switch to teleop intervention."""
+        self.episode_step = 0
+        self.action_chunk_idx = 0
+        self.current_action_chunk = None
+        self.prev_normalized_chunk = None
+        self._last_action = None
+        self.is_running = True
+
+        if events is None:
+            events = {"exit_early": False, "rerecord_episode": False,
+                      "stop_recording": False,
+                      "switch_to_teleop": False, "switch_to_rollout": False}
+
+        camera_features = list(self.robot.camera_features.keys())
+        for cam in camera_features:
+            cv2.namedWindow(cam, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(cam, 640, 480)
+
+        logger.info(f"Starting intervention episode with prompt: '{task_prompt}'")
+        say_tts('starting intervention episode')
+        time.sleep(2)
+
+        # --- Phase 1: Policy rollout until intervention triggered ---
+        while self.is_running and self.episode_step < self.max_steps:
+            start_loop_time = time.perf_counter()
+
+            if self.display:
+                observation_dict = self.robot.capture_observation()
+                for cam in camera_features:
+                    image_hwc = observation_dict[cam].numpy()
+                    cv2.imshow(cam, cv2.cvtColor(image_hwc, cv2.COLOR_RGB2BGR))
+                    cv2.waitKey(1)
+
+            # Request new action chunk when consumed
+            if self.current_action_chunk is None or self.action_chunk_idx >= self.open_loop_horizon:
+                observation_dict = self.robot.capture_observation()
+                joint_positions = observation_dict['observation.state'].numpy()
+
+                gr00t_obs = self.build_gr00t_observation(
+                    joint_positions, observation_dict, task_prompt
+                )
+
+                rtc_opts = None
+                if self.use_rtc and self.prev_normalized_chunk is not None:
+                    rtc_opts = {
+                        "previous_action_chunk": self.prev_normalized_chunk,
+                        "action_horizon": self.action_chunk_size,
+                        "rtc_overlap_steps": self.rtc_overlap_steps,
+                        "rtc_frozen_steps": self.rtc_frozen_steps,
+                        "rtc_ramp_rate": self.rtc_ramp_rate,
+                    }
+
+                response = self.policy_client.get_action(gr00t_obs, options=rtc_opts)
+                self.current_action_chunk = self.parse_gr00t_action(response)
+                if self.use_rtc:
+                    _, info = response
+                    if isinstance(info, dict) and "normalized_action" in info:
+                        self.prev_normalized_chunk = info["normalized_action"]
+
+                self.action_chunk_idx = 0
+
+            a_t = self.current_action_chunk[self.action_chunk_idx]
+
+            if self.adjust_for_sim_to_real:
+                a_t = a_t.copy()
+                a_t[7] = 1.05 * (a_t[7] + 0.01)
+                a_t[8] = a_t[8] - 0.025
+                a_t[9] = a_t[9] + 0.025
+
+            actual_action = self.execute_action(a_t)
+
+            if dataset is not None:
+                obs = self.robot.capture_observation()
+                frame = {
+                    **obs,
+                    "action": actual_action,
+                    "task": task_prompt,
+                }
+                dataset.add_frame(frame)
+
+            self.action_chunk_idx += 1
+            self.episode_step += 1
+
+            dt_s = time.perf_counter() - start_loop_time
+            busy_wait_time = self.dt - dt_s
+            if busy_wait_time > 0:
+                time.sleep(busy_wait_time)
+
+            if events["exit_early"]:
+                events["exit_early"] = False
+                break
+
+            if events["switch_to_teleop"]:
+                break
+
+        # No intervention triggered — episode over
+        if not events["switch_to_teleop"]:
+            self.is_running = False
+            logger.info(f"Intervention episode completed (no intervention) after {self.episode_step} steps")
+            return
+
+        # --- Phase 2: Transition from policy to teleop ---
+        events["switch_to_teleop"] = False
+        logger.info("Intervention triggered — freezing follower, aligning leader")
+        say_tts("intervention: hold the leader arms")
+
+        try:
+            # Disable clamping — Phase 2 alignment + Phase 3 teleop
+            self._set_max_relative_target(None)
+
+            # Move leader arms to match current follower positions
+            for name in self.robot.follower_arms:
+                follower_pos = self.robot.follower_arms[name].read("Present_Position")
+                self.robot.leader_arms[name].driver.set_all_modes(trossen.Mode.position)
+                self.robot.leader_arms[name].driver.set_all_positions(follower_pos, 5.0, False)
+            time.sleep(2)
+
+            logger.info("Leaders aligned — grip the leaders, then press down arrow again")
+            say_tts("grip leaders and press down arrow")
+
+            # Wait for user to grab leaders and press down arrow to signal ready
+            while not events["switch_to_teleop"]:
+                time.sleep(0.1)
+            events["switch_to_teleop"] = False
+
+            # Release leader torque so user can move them freely
+            for name in self.robot.leader_arms:
+                self.robot.leader_arms[name].write("Torque_Enable", 0)
+
+            logger.info("Teleop active")
+            say_tts("teleop active")
+
+            # --- Phase 3: Teleop until episode ends ---
+            while self.is_running and self.episode_step < self.max_steps:
+                start_loop_time = time.perf_counter()
+
+                if self.display:
+                    observation_dict = self.robot.capture_observation()
+                    for cam in camera_features:
+                        image_hwc = observation_dict[cam].numpy()
+                        cv2.imshow(cam, cv2.cvtColor(image_hwc, cv2.COLOR_RGB2BGR))
+                        cv2.waitKey(1)
+
+                observation, action = self.robot.teleop_step(record_data=True)
+
+                if dataset is not None:
+                    frame = {
+                        **observation,
+                        "action": action["action"],
+                        "task": task_prompt,
+                    }
+                    dataset.add_frame(frame)
+
+                self.episode_step += 1
+
+                dt_s = time.perf_counter() - start_loop_time
+                busy_wait_time = self.dt - dt_s
+                if busy_wait_time > 0:
+                    time.sleep(busy_wait_time)
+
+                if events["exit_early"]:
+                    events["exit_early"] = False
+                    break
+        finally:
+            self.restore_max_relative_target()
+
+        self.is_running = False
+        logger.info(f"Intervention episode completed after {self.episode_step} steps")
+
+    def autonomous_mode(self, task_prompt: str = "transfer the cube",
+                       dataset=None, num_episodes: int = 1):
+        """Run one or more episodes in the configured record_mode."""
+        logger.info(f"Starting autonomous mode ({self.record_mode}), {num_episodes} episode(s)")
+        listener, events = init_keyboard_listener()
+
+        reset_time_s = 10
+        say_tts("reset environment")
+        time.sleep(reset_time_s)
+
+        recorded_episodes = 0
+        while recorded_episodes < num_episodes:
+            if events["stop_recording"]:
+                say_tts("stopped recording")
+                break
+
+            ep_index = dataset.num_episodes if dataset else recorded_episodes
+            logger.info(f"Recording episode {ep_index} ({recorded_episodes + 1}/{num_episodes})")
+            say_tts(f"starting episode {ep_index}")
+            time.sleep(2)
+
+            # Dispatch to the right episode runner
+            if self.record_mode == "teleoperate":
+                self.release_leaders()
+                self.run_episode_teleoperate(task_prompt=task_prompt,
+                                             dataset=dataset, events=events)
+            elif self.record_mode == "intervention":
+                self.run_episode_intervention(task_prompt=task_prompt,
+                                              dataset=dataset, events=events)
+            else:  # "rollout"
+                self.run_episode_rollout(task_prompt=task_prompt,
+                                         dataset=dataset, events=events)
+
+            # After each episode, freeze followers and hold leaders back in position
+            self.robot.teleop_safety_stop()
+            self.hold_leaders()
+
+            # Reset period between episodes (unless we're stopping or re-recording last)
+            if not events["stop_recording"] and (
+                recorded_episodes < num_episodes - 1 or events["rerecord_episode"]
+            ):
+                say_tts("reset environment")
+                time.sleep(reset_time_s)
+                if events["exit_early"]:
+                    events["exit_early"] = False
+
+            # Handle re-record
+            if events["rerecord_episode"]:
+                logger.info("Re-recording episode")
+                say_tts("re-record episode")
+                time.sleep(3)
+                events["rerecord_episode"] = False
+                events["exit_early"] = False
+                if dataset is not None:
+                    dataset.clear_episode_buffer()
+                continue
+
+            # Save the just-completed episode
+            if dataset is not None:
+                logger.info(f"Saving episode {ep_index}")
+                say_tts(f"saving episode {ep_index}")
+                time.sleep(2)
+                dataset.save_episode()
+                logger.info(f"Finished saving episode {ep_index}")
+                say_tts(f"Finished saving episode {ep_index}")
+                time.sleep(3)
+
+            recorded_episodes += 1
+
+            if events["stop_recording"]:
+                say_tts("stopped recording")
+                time.sleep(2)
+                break
+
+        if listener is not None:
+            listener.stop()
+
+    def hold_leaders(self):
+        """Set leaders to position hold mode (they resist manual movement)."""
+        for name in self.robot.leader_arms:
+            self.robot.leader_arms[name].driver.set_all_modes(trossen.Mode.position)
+
+    def _set_max_relative_target(self, value):
+        """Set the runtime clamp on per-step joint motion. Pass None to disable."""
+        self.robot.config.max_relative_target = value
+
+    def restore_max_relative_target(self):
+        """Restore max_relative_target to the CLI-configured value (rollout safety default)."""
+        self._set_max_relative_target(self._cli_max_relative_target)
+
+    def release_leaders(self):
+        """Disable leader torque so user can move them freely for teleop."""
+        for name in self.robot.leader_arms:
+            self.robot.leader_arms[name].write("Torque_Enable", 0)
 
     def cleanup(self):
         """Clean up resources."""
         logger.info("Cleaning up...")
         self.robot.disconnect()
 
+def parse_bool(value):
+    if value.lower() in ('true', '1', 'yes'):
+        return True
+    if value.lower() in ('false', '0', 'no'):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got '{value}'")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -490,6 +853,20 @@ if __name__ == "__main__":
                          "Do NOT use 0.0 (would freeze robot).")
     parser.add_argument("--diagnostics", action="store_true",
                         help="Enable diagnostic logging (RTC freeze checks, action deltas, etc.)")
+    # --- Recording arguments ---
+    parser.add_argument("--record_mode", default="rollout",
+                        choices=["rollout", "teleoperate", "intervention"],
+                        help="Recording mode: rollout, teleoperate, or intervention (DAgger)")
+    parser.add_argument("--repo_id", default=None,
+                        help="Dataset repo ID (e.g. ANRedlich/my_new_dataset)")
+    parser.add_argument("--dataset_root", default=None,
+                        help="Local dataset root path")
+    parser.add_argument("--resume", type=parse_bool, default=False,
+                        help="Resume appending to an existing dataset")
+    parser.add_argument("--num_episodes", type=int, default=1,
+                        help="Number of episodes to record")
+    parser.add_argument("--use_videos", type=parse_bool, default=True,
+                        help="Save videos (vs image sequences)")
     args = parser.parse_args()
 
     # Enable diagnostics logging if requested
@@ -512,7 +889,39 @@ if __name__ == "__main__":
         rtc_frozen_steps=args.rtc_frozen_steps,
         rtc_ramp_rate=args.rtc_ramp_rate,
         action_smooth_alpha=args.action_smooth_alpha,
+        record_mode=args.record_mode,
     )
 
-    bridge.autonomous_mode(task_prompt=args.task_prompt)
+    # Create or resume dataset if repo_id and dataset_root provided
+    dataset = None
+    if args.repo_id and args.dataset_root:
+        if args.resume:
+            dataset = LeRobotDataset(args.repo_id, root=args.dataset_root)
+            dataset.start_image_writer(
+                num_processes=1,
+                num_threads=4 * len(bridge.robot.cameras),
+            )
+        else:
+            dataset = LeRobotDataset.create(
+                args.repo_id,
+                args.control_freq,
+                root=args.dataset_root,
+                robot_type=bridge.robot.robot_type,
+                features=bridge.dataset_features,
+                use_videos=args.use_videos,
+                image_writer_processes=1,
+                image_writer_threads=4 * len(bridge.robot.cameras),
+            )
+    else:
+        logger.info("No repo_id/dataset_root — running without recording")
+
+    bridge.autonomous_mode(
+        task_prompt=args.task_prompt,
+        dataset=dataset,
+        num_episodes=args.num_episodes,
+    )
+
+    if dataset is not None:
+        dataset.stop_image_writer()
+
     bridge.cleanup()
