@@ -428,6 +428,8 @@ class TrossenGR00TBridge:
 
             # Maintain control frequency
             dt_s = time.perf_counter() - start_loop_time
+            if self.episode_step % 100 == 0:
+                logger.info(f"loop dt: {dt_s*1000:.1f} ms (budget {self.dt*1000:.1f} ms)")
             busy_wait_time = self.dt - dt_s
             if busy_wait_time > 0:
                 time.sleep(busy_wait_time)

@@ -70,6 +70,7 @@ class TrossenGR00TBridge:
         rtc_ramp_rate: float = 15.0,
         action_smooth_alpha: float = 1.0,
         record_mode: str = "rollout",
+        max_teleop_time_s: float = 0.0,
     ):        
         """
         ...
@@ -118,6 +119,7 @@ class TrossenGR00TBridge:
                 self.dataset_features[key] = {'dtype': 'video', **ft}
 
         self.record_mode = record_mode
+        self.max_teleop_time_s = max_teleop_time_s
         if record_mode == 'rollout':
             self.robot.leader_arms = {}
 
@@ -182,8 +184,8 @@ class TrossenGR00TBridge:
             logger.info(f"TEST MODE: Would execute action: {full_action}")
             return full_action
         if self.test_mode == "autonomous":
-            self.robot.send_action(full_action)
-            return full_action
+            return self.robot.send_action(full_action)
+            #return full_action
         else:
             logger.error(f"Unknown mode: {self.test_mode}. No action executed.")
             return full_action
@@ -461,6 +463,8 @@ class TrossenGR00TBridge:
 
             # Maintain control frequency
             dt_s = time.perf_counter() - start_loop_time
+            if self.episode_step % 100 == 0:
+                        logger.info(f"loop dt: {dt_s*1000:.1f} ms (budget {self.dt*1000:.1f} ms)")            
             busy_wait_time = self.dt - dt_s
             if busy_wait_time > 0:
                 time.sleep(busy_wait_time)
@@ -523,6 +527,8 @@ class TrossenGR00TBridge:
 
                 # Maintain control frequency
                 dt_s = time.perf_counter() - start_loop_time
+                if self.episode_step % 100 == 0:
+                        logger.info(f"loop dt: {dt_s*1000:.1f} ms (budget {self.dt*1000:.1f} ms)")
                 busy_wait_time = self.dt - dt_s
                 if busy_wait_time > 0:
                     time.sleep(busy_wait_time)
@@ -560,152 +566,234 @@ class TrossenGR00TBridge:
         say_tts('starting intervention episode')
         time.sleep(2)
 
-        # --- Phase 1: Policy rollout until intervention triggered ---
-        while self.is_running and self.episode_step < self.max_steps:
-            start_loop_time = time.perf_counter()
-
-            if self.display:
-                observation_dict = self.robot.capture_observation()
-                for cam in camera_features:
-                    image_hwc = observation_dict[cam].numpy()
-                    cv2.imshow(cam, cv2.cvtColor(image_hwc, cv2.COLOR_RGB2BGR))
-                    cv2.waitKey(1)
-
-            # Request new action chunk when consumed
-            if self.current_action_chunk is None or self.action_chunk_idx >= self.open_loop_horizon:
-                observation_dict = self.robot.capture_observation()
-                joint_positions = observation_dict['observation.state'].numpy()
-
-                gr00t_obs = self.build_gr00t_observation(
-                    joint_positions, observation_dict, task_prompt
-                )
-
-                rtc_opts = None
-                if self.use_rtc and self.prev_normalized_chunk is not None:
-                    rtc_opts = {
-                        "previous_action_chunk": self.prev_normalized_chunk,
-                        "action_horizon": self.action_chunk_size,
-                        "rtc_overlap_steps": self.rtc_overlap_steps,
-                        "rtc_frozen_steps": self.rtc_frozen_steps,
-                        "rtc_ramp_rate": self.rtc_ramp_rate,
-                    }
-
-                response = self.policy_client.get_action(gr00t_obs, options=rtc_opts)
-                self.current_action_chunk = self.parse_gr00t_action(response)
-                if self.use_rtc:
-                    _, info = response
-                    if isinstance(info, dict) and "normalized_action" in info:
-                        self.prev_normalized_chunk = info["normalized_action"]
-
-                self.action_chunk_idx = 0
-
-            a_t = self.current_action_chunk[self.action_chunk_idx]
-
-            if self.adjust_for_sim_to_real:
-                a_t = a_t.copy()
-                a_t[7] = 1.05 * (a_t[7] + 0.01)
-                a_t[8] = a_t[8] - 0.025
-                a_t[9] = a_t[9] + 0.025
-
-            actual_action = self.execute_action(a_t)
-
-            if dataset is not None:
-                obs = self.robot.capture_observation()
-                frame = {
-                    **obs,
-                    "action": actual_action,
-                    "task": task_prompt,
-                }
-                dataset.add_frame(frame)
-
-            self.action_chunk_idx += 1
-            self.episode_step += 1
-
-            dt_s = time.perf_counter() - start_loop_time
-            busy_wait_time = self.dt - dt_s
-            if busy_wait_time > 0:
-                time.sleep(busy_wait_time)
-
-            if events["exit_early"]:
-                events["exit_early"] = False
-                break
-
-            if events["switch_to_teleop"]:
-                break
-
-        # No intervention triggered — episode over
-        if not events["switch_to_teleop"]:
-            self.is_running = False
-            logger.info(f"Intervention episode completed (no intervention) after {self.episode_step} steps")
-            return
-
-        # --- Phase 2: Transition from policy to teleop ---
+        n_interventions = 0
+        # Discard any stale arrow presses from before the episode started
         events["switch_to_teleop"] = False
-        logger.info("Intervention triggered — freezing follower, aligning leader")
-        say_tts("intervention: hold the leader arms")
+        events["switch_to_rollout"] = False
 
         try:
-            # Disable clamping — Phase 2 alignment + Phase 3 teleop
-            self._set_max_relative_target(None)
+            # Intervention cycle: rollout -> align -> teleop -> paused -> rollout ...
+            logger.info(f"Rollout entry: max_relative_target={self.robot.config.max_relative_target}, "
+                            f"EMA fresh={self._last_action is None}")
+            while True:
+                # --- Phase 1: Policy rollout until intervention triggered ---
+                while self.is_running and self.episode_step < self.max_steps:
+                    start_loop_time = time.perf_counter()
 
-            # Move leader arms to match current follower positions
-            for name in self.robot.follower_arms:
-                follower_pos = self.robot.follower_arms[name].read("Present_Position")
-                self.robot.leader_arms[name].driver.set_all_modes(trossen.Mode.position)
-                self.robot.leader_arms[name].driver.set_all_positions(follower_pos, 5.0, False)
-            time.sleep(2)
+                    if self.display:
+                        observation_dict = self.robot.capture_observation()
+                        for cam in camera_features:
+                            image_hwc = observation_dict[cam].numpy()
+                            cv2.imshow(cam, cv2.cvtColor(image_hwc, cv2.COLOR_RGB2BGR))
+                            cv2.waitKey(1)
 
-            logger.info("Leaders aligned — grip the leaders, then press down arrow again")
-            say_tts("grip leaders and press down arrow")
+                    # Request new action chunk when consumed
+                    if self.current_action_chunk is None or self.action_chunk_idx >= self.open_loop_horizon:
+                        observation_dict = self.robot.capture_observation()
+                        joint_positions = observation_dict['observation.state'].numpy()
 
-            # Wait for user to grab leaders and press down arrow to signal ready
-            while not events["switch_to_teleop"]:
-                time.sleep(0.1)
-            events["switch_to_teleop"] = False
+                        gr00t_obs = self.build_gr00t_observation(
+                            joint_positions, observation_dict, task_prompt
+                        )
 
-            # Release leader torque so user can move them freely
-            for name in self.robot.leader_arms:
-                self.robot.leader_arms[name].write("Torque_Enable", 0)
+                        rtc_opts = None
+                        if self.use_rtc and self.prev_normalized_chunk is not None:
+                            rtc_opts = {
+                                "previous_action_chunk": self.prev_normalized_chunk,
+                                "action_horizon": self.action_chunk_size,
+                                "rtc_overlap_steps": self.rtc_overlap_steps,
+                                "rtc_frozen_steps": self.rtc_frozen_steps,
+                                "rtc_ramp_rate": self.rtc_ramp_rate,
+                            }
 
-            logger.info("Teleop active")
-            say_tts("teleop active")
+                        response = self.policy_client.get_action(gr00t_obs, options=rtc_opts)
+                        self.current_action_chunk = self.parse_gr00t_action(response)
+                        if self.use_rtc:
+                            _, info = response
+                            if isinstance(info, dict) and "normalized_action" in info:
+                                self.prev_normalized_chunk = info["normalized_action"]
 
-            # --- Phase 3: Teleop until episode ends ---
-            while self.is_running and self.episode_step < self.max_steps:
-                start_loop_time = time.perf_counter()
+                        self.action_chunk_idx = 0
+                        #diagnostics (2 lines plus 2 loggers)
+                        first_delta = self.current_action_chunk[0] - joint_positions
+                        chunk_deltas = np.diff(self.current_action_chunk, axis=0)
+                        logger.info(f"New chunk: |first_action - state| max={np.abs(first_delta).max():.4f} rad, "
+                                    f"per-joint={np.round(first_delta, 3)}")
+                        logger.info(f"New chunk: largest within-chunk step={np.abs(chunk_deltas).max():.4f} rad")
 
-                if self.display:
-                    observation_dict = self.robot.capture_observation()
-                    for cam in camera_features:
-                        image_hwc = observation_dict[cam].numpy()
-                        cv2.imshow(cam, cv2.cvtColor(image_hwc, cv2.COLOR_RGB2BGR))
-                        cv2.waitKey(1)
+                    a_t = self.current_action_chunk[self.action_chunk_idx]
 
-                observation, action = self.robot.teleop_step(record_data=True)
+                    if self.adjust_for_sim_to_real:
+                        a_t = a_t.copy()
+                        a_t[7] = 1.05 * (a_t[7] + 0.01)
+                        a_t[8] = a_t[8] - 0.025
+                        a_t[9] = a_t[9] + 0.025
 
-                if dataset is not None:
-                    frame = {
-                        **observation,
-                        "action": action["action"],
-                        "task": task_prompt,
-                    }
-                    dataset.add_frame(frame)
+                    actual_action = self.execute_action(a_t)
 
-                self.episode_step += 1
+                    if dataset is not None:
+                        obs = self.robot.capture_observation()
+                        frame = {
+                            **obs,
+                            "action": actual_action,
+                            "task": task_prompt,
+                        }
+                        dataset.add_frame(frame)
 
-                dt_s = time.perf_counter() - start_loop_time
-                busy_wait_time = self.dt - dt_s
-                if busy_wait_time > 0:
-                    time.sleep(busy_wait_time)
+                    self.action_chunk_idx += 1
+                    self.episode_step += 1
 
+                    dt_s = time.perf_counter() - start_loop_time
+                    if self.episode_step % 100 == 0:
+                        logger.info(f"loop dt: {dt_s*1000:.1f} ms (budget {self.dt*1000:.1f} ms)")
+                    busy_wait_time = self.dt - dt_s
+                    if busy_wait_time > 0:
+                        time.sleep(busy_wait_time)
+
+                    if events["exit_early"]:
+                        events["exit_early"] = False
+                        break
+
+                    # Protocol: up arrow is inconsistent during rollout -- ignore it
+                    if events["switch_to_rollout"]:
+                        events["switch_to_rollout"] = False
+
+                    if events["switch_to_teleop"]:
+                        break
+
+                # No intervention -- exit_early or max_steps; episode over
+                if not events["switch_to_teleop"]:
+                    break
+
+                # --- Phase 2: Transition from policy to teleop ---
+                events["switch_to_teleop"] = False
+                n_interventions += 1
+                logger.info("Intervention triggered — freezing follower, aligning leader")
+                say_tts("intervention: hold the leader arms")
+
+                # Disable clamping — Phase 2 alignment + Phase 3 teleop
+                self._set_max_relative_target(None)
+
+                # Move leader arms to match current follower positions
+                for name in self.robot.follower_arms:
+                    follower_pos = self.robot.follower_arms[name].read("Present_Position")
+                    self.robot.leader_arms[name].driver.set_all_modes(trossen.Mode.position)
+                    self.robot.leader_arms[name].driver.set_all_positions(follower_pos, 5.0, False)
+                time.sleep(2)
+
+                logger.info("Leaders aligned — grip the leaders, then press down arrow again")
+                say_tts("grip leaders and press down arrow")
+
+                # Wait for down arrow; ignore up arrow; honor exit_early
+                while not events["switch_to_teleop"] and not events["exit_early"]:
+                    if events["switch_to_rollout"]:
+                        events["switch_to_rollout"] = False
+                    time.sleep(0.1)
                 if events["exit_early"]:
                     events["exit_early"] = False
                     break
+                events["switch_to_teleop"] = False
+
+                # Release leader torque so user can move them freely
+                for name in self.robot.leader_arms:
+                    self.robot.leader_arms[name].write("Torque_Enable", 0)
+
+                logger.info("Teleop active")
+                say_tts("teleop active")
+                teleop_start_t = time.perf_counter()
+                pause_requested = False
+
+                # --- Phase 3: Teleop until episode ends ---
+                while self.is_running and self.episode_step < self.max_steps:
+                    start_loop_time = time.perf_counter()
+
+                    if self.display:
+                        observation_dict = self.robot.capture_observation()
+                        for cam in camera_features:
+                            image_hwc = observation_dict[cam].numpy()
+                            cv2.imshow(cam, cv2.cvtColor(image_hwc, cv2.COLOR_RGB2BGR))
+                            cv2.waitKey(1)
+
+                    observation, action = self.robot.teleop_step(record_data=True)
+
+                    if dataset is not None:
+                        frame = {
+                            **observation,
+                            "action": action["action"],
+                            "task": task_prompt,
+                        }
+                        dataset.add_frame(frame)
+
+                    self.episode_step += 1
+
+                    dt_s = time.perf_counter() - start_loop_time
+                    if self.episode_step % 100 == 0:
+                        logger.info(f"loop dt: {dt_s*1000:.1f} ms (budget {self.dt*1000:.1f} ms)")                    
+                    busy_wait_time = self.dt - dt_s
+                    if busy_wait_time > 0:
+                        time.sleep(busy_wait_time)
+
+                    if events["exit_early"]:
+                        events["exit_early"] = False
+                        break
+
+                    # Protocol: down arrow is inconsistent during teleop -- ignore it
+                    if events["switch_to_teleop"]:
+                        events["switch_to_teleop"] = False
+
+                    if events["switch_to_rollout"]:
+                        events["switch_to_rollout"] = False
+                        logger.info("Up arrow -- pausing teleop")
+                        pause_requested = True
+                        break
+
+                    if (self.max_teleop_time_s and self.max_teleop_time_s > 0
+                            and time.perf_counter() - teleop_start_t >= self.max_teleop_time_s):
+                        logger.info(f"Teleop time limit ({self.max_teleop_time_s}s) reached -- pausing")
+                        say_tts("teleop time limit reached")
+                        pause_requested = True
+                        break
+
+                if not pause_requested:
+                    break   # exit_early or max_steps -- episode over
+
+                # --- Phase 4: Paused -- wait for up arrow to resume rollout ---
+                self.hold_leaders()
+                logger.info("Paused -- release the leaders, then press up arrow to resume rollout")
+                say_tts("paused. release leaders, then press up arrow to resume rollout")
+                events["switch_to_rollout"] = False  # require a fresh up press
+
+                while not events["switch_to_rollout"] and not events["exit_early"]:
+                    if events["switch_to_teleop"]:
+                        events["switch_to_teleop"] = False
+                    time.sleep(0.1)
+                if events["exit_early"]:
+                    events["exit_early"] = False
+                    break
+                events["switch_to_rollout"] = False
+
+                # Re-arm the policy: restore safety clamp and force a fresh
+                # replan from the CURRENT robot state (old chunk / RTC / EMA
+                # state is stale after the human moved the arms)
+                self.restore_max_relative_target()
+                self.current_action_chunk = None
+                self.action_chunk_idx = 0
+                self.prev_normalized_chunk = None
+                self._last_action = None
+                logger.info(f"Resume check: max_relative_target={self.robot.config.max_relative_target}, "
+                            f"chunk cleared={self.current_action_chunk is None}, "
+                            f"EMA reset={self._last_action is None}")
+
+                logger.info("Resuming rollout")
+                say_tts("rollout resumed")
+                # falls through to the top of `while True` -> Phase 1 rollout
+
         finally:
             self.restore_max_relative_target()
 
         self.is_running = False
-        logger.info(f"Intervention episode completed after {self.episode_step} steps")
+        logger.info(f"Intervention episode completed after {self.episode_step} steps "
+                    f"with {n_interventions} intervention(s)")
 
     def autonomous_mode(self, task_prompt: str = "transfer the cube",
                        dataset=None, num_episodes: int = 1):
@@ -854,6 +942,9 @@ if __name__ == "__main__":
     parser.add_argument("--diagnostics", action="store_true",
                         help="Enable diagnostic logging (RTC freeze checks, action deltas, etc.)")
     # --- Recording arguments ---
+    parser.add_argument("--max_teleop_time_s", type=float, default=0.0,
+                        help="Intervention mode: auto-pause teleop after this many "
+                             "seconds, as if the up arrow were pressed (0 = disabled)")
     parser.add_argument("--record_mode", default="rollout",
                         choices=["rollout", "teleoperate", "intervention"],
                         help="Recording mode: rollout, teleoperate, or intervention (DAgger)")
@@ -890,6 +981,7 @@ if __name__ == "__main__":
         rtc_ramp_rate=args.rtc_ramp_rate,
         action_smooth_alpha=args.action_smooth_alpha,
         record_mode=args.record_mode,
+        max_teleop_time_s=args.max_teleop_time_s,
     )
 
     # Create or resume dataset if repo_id and dataset_root provided
