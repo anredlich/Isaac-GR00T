@@ -71,6 +71,8 @@ class TrossenGR00TBridge:
         action_smooth_alpha: float = 1.0,
         record_mode: str = "rollout",
         max_teleop_time_s: float = 0.0,
+        tpad_s: float = 2.0,
+        clip_teleop: bool = False,        
     ):        
         """
         ...
@@ -120,6 +122,8 @@ class TrossenGR00TBridge:
 
         self.record_mode = record_mode
         self.max_teleop_time_s = max_teleop_time_s
+        self.tpad_s = tpad_s
+        self.clip_teleop = clip_teleop        
         if record_mode == 'rollout':
             self.robot.leader_arms = {}
 
@@ -551,6 +555,9 @@ class TrossenGR00TBridge:
         self.prev_normalized_chunk = None
         self._last_action = None
         self.is_running = True
+        # clip_teleop: track first-teleop [start, end) frame indices (offline trim)
+        self._clip_teleop_start = None
+        self._clip_teleop_end = None
 
         if events is None:
             events = {"exit_early": False, "rerecord_episode": False,
@@ -694,20 +701,25 @@ class TrossenGR00TBridge:
                     break
                 events["switch_to_teleop"] = False
 
-                # Release leader torque so user can move them freely
-                for name in self.robot.leader_arms:
-                    self.robot.leader_arms[name].write("Torque_Enable", 0)
-
                 logger.info("Teleop active")
                 say_tts("teleop active")
                 teleop_start_t = time.perf_counter()
                 pause_requested = False
 
+                # Release leader torque LAST — motion becomes possible immediately
+                # before the first capture, minimizing the position jump.
+                for name in self.robot.leader_arms:
+                    self.robot.leader_arms[name].write("Torque_Enable", 0)
+
                 # --- Phase 3: Teleop until episode ends ---
+                first_teleop = True
                 while self.is_running and self.episode_step < self.max_steps:
                     start_loop_time = time.perf_counter()
 
-                    if self.display:
+                    # Skip the display capture on the FIRST teleop frame so the
+                    # first recorded frame lands as soon as possible after torque
+                    # release (minimizes the rollout->teleop position jump).
+                    if self.display and not first_teleop:
                         observation_dict = self.robot.capture_observation()
                         for cam in camera_features:
                             image_hwc = observation_dict[cam].numpy()
@@ -715,6 +727,7 @@ class TrossenGR00TBridge:
                             cv2.waitKey(1)
 
                     observation, action = self.robot.teleop_step(record_data=True)
+                    first_teleop = False
 
                     if dataset is not None:
                         frame = {
@@ -723,6 +736,10 @@ class TrossenGR00TBridge:
                             "task": task_prompt,
                         }
                         dataset.add_frame(frame)
+
+                    # clip_teleop: mark frame index where first teleop begins
+                    if self.clip_teleop and self._clip_teleop_start is None:
+                        self._clip_teleop_start = self.episode_step
 
                     self.episode_step += 1
 
@@ -753,6 +770,11 @@ class TrossenGR00TBridge:
                         say_tts("teleop time limit reached")
                         pause_requested = True
                         break
+
+                # clip_teleop: first teleop segment just ended; record end index
+                if (self.clip_teleop and self._clip_teleop_start is not None
+                        and self._clip_teleop_end is None):
+                    self._clip_teleop_end = self.episode_step
 
                 if not pause_requested:
                     break   # exit_early or max_steps -- episode over
@@ -795,6 +817,61 @@ class TrossenGR00TBridge:
         logger.info(f"Intervention episode completed after {self.episode_step} steps "
                     f"with {n_interventions} intervention(s)")
 
+    def _clip_begin(self, dataset):
+        """clip_teleop: start recording into a throwaway temp dataset. Returns
+        the temp dataset (the episode runner writes to it)."""
+        import os
+        import uuid
+        import tempfile
+        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+        self._clip_temp_root = os.path.join(
+            tempfile.gettempdir(), f"clip_rec_{uuid.uuid4().hex}")        
+        self._clip_temp_ds = LeRobotDataset.create(
+            f"clip_temp_{int(time.time())}",
+            self.control_frequency,
+            root=self._clip_temp_root,
+            robot_type=self.robot.robot_type,
+            features=self.dataset_features,
+            use_videos=True,
+            image_writer_processes=1,
+            image_writer_threads=4 * len(self.robot.cameras),
+        )
+        return self._clip_temp_ds
+
+    def _clip_finish(self, dataset, task_prompt):
+        """clip_teleop: finalize the temp episode, trim it, and add the trimmed
+        frames into the real `dataset` (caller then calls dataset.save_episode()).
+        Returns the real dataset. Discards the temp."""
+        from dataset_trim_utils import trim_and_add_episode
+        self._clip_temp_ds.save_episode()
+        try:
+            dataset = trim_and_add_episode(
+                temp_dataset_root=self._clip_temp_root,
+                target_dataset=dataset,
+                teleop_start=self._clip_teleop_start,
+                teleop_end=self._clip_teleop_end,
+                tpad_s=self.tpad_s,
+                task_prompt=task_prompt,
+            )
+        finally:
+            self._clip_discard()
+        return dataset
+
+    def _clip_discard(self):
+        """clip_teleop: stop the temp image writer and delete temp files."""
+        import shutil
+        ds = getattr(self, "_clip_temp_ds", None)
+        root = getattr(self, "_clip_temp_root", None)
+        try:
+            if ds is not None:
+                ds.stop_image_writer()
+        except Exception:
+            pass
+        if root is not None:
+            shutil.rmtree(root, ignore_errors=True)
+        self._clip_temp_ds = None
+        self._clip_temp_root = None
+
     def autonomous_mode(self, task_prompt: str = "transfer the cube",
                        dataset=None, num_episodes: int = 1):
         """Run one or more episodes in the configured record_mode."""
@@ -817,16 +894,17 @@ class TrossenGR00TBridge:
             time.sleep(2)
 
             # Dispatch to the right episode runner
+            rec_dataset = self._clip_begin(dataset) if self.clip_teleop else dataset
             if self.record_mode == "teleoperate":
                 self.release_leaders()
                 self.run_episode_teleoperate(task_prompt=task_prompt,
-                                             dataset=dataset, events=events)
+                                             dataset=rec_dataset, events=events)
             elif self.record_mode == "intervention":
                 self.run_episode_intervention(task_prompt=task_prompt,
-                                              dataset=dataset, events=events)
+                                              dataset=rec_dataset, events=events)
             else:  # "rollout"
                 self.run_episode_rollout(task_prompt=task_prompt,
-                                         dataset=dataset, events=events)
+                                         dataset=rec_dataset, events=events)
 
             # After each episode, freeze followers and hold leaders back in position
             self.robot.teleop_safety_stop()
@@ -848,8 +926,19 @@ class TrossenGR00TBridge:
                 time.sleep(3)
                 events["rerecord_episode"] = False
                 events["exit_early"] = False
+                if self.clip_teleop:
+                    self._clip_discard()
                 if dataset is not None:
                     dataset.clear_episode_buffer()
+                continue
+
+            # clip_teleop: no teleop captured -> discard temp, don't count episode
+            if self.clip_teleop and self._clip_teleop_start is None:
+                logger.info("clip_teleop: no teleop captured — discarding")
+                say_tts("no teleop, discarding episode")
+                self._clip_discard()
+                if events["stop_recording"]:
+                    break
                 continue
 
             # Save the just-completed episode
@@ -857,6 +946,8 @@ class TrossenGR00TBridge:
                 logger.info(f"Saving episode {ep_index}")
                 say_tts(f"saving episode {ep_index}")
                 time.sleep(2)
+                if self.clip_teleop:
+                    dataset = self._clip_finish(dataset, task_prompt)  # trims+adds into real dataset
                 dataset.save_episode()
                 logger.info(f"Finished saving episode {ep_index}")
                 say_tts(f"Finished saving episode {ep_index}")
@@ -948,6 +1039,12 @@ if __name__ == "__main__":
     parser.add_argument("--record_mode", default="rollout",
                         choices=["rollout", "teleoperate", "intervention"],
                         help="Recording mode: rollout, teleoperate, or intervention (DAgger)")
+    parser.add_argument("--tpad", type=float, default=2.0,
+                        help="clip_teleop: seconds of rollout kept before the "
+                             "first teleop segment (default 2.0)")
+    parser.add_argument("--clip_teleop", type=parse_bool, default=False,
+                        help="Intervention mode only: trim each episode to the "
+                             "first teleop segment + tpad lead-in (offline).")
     parser.add_argument("--repo_id", default=None,
                         help="Dataset repo ID (e.g. ANRedlich/my_new_dataset)")
     parser.add_argument("--dataset_root", default=None,
@@ -982,6 +1079,8 @@ if __name__ == "__main__":
         action_smooth_alpha=args.action_smooth_alpha,
         record_mode=args.record_mode,
         max_teleop_time_s=args.max_teleop_time_s,
+        tpad_s=args.tpad,
+        clip_teleop=args.clip_teleop,
     )
 
     # Create or resume dataset if repo_id and dataset_root provided
