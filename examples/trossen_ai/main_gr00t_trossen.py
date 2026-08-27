@@ -112,6 +112,7 @@ class TrossenGR00TBridge:
         self.action_chunk_idx = 0
         self.action_chunk_size = action_chunk_size
         self.open_loop_horizon = open_loop_horizon  # GR00T-specific: execute fewer than full chunk
+        assert open_loop_horizon <= action_chunk_size, "open_loop_horizon must be <= action_chunk_size"
         self.episode_step = 0
         # RTC config
         self.use_rtc = use_rtc

@@ -136,6 +136,7 @@ class TrossenGR00TBridge:
         self.action_chunk_idx = 0
         self.action_chunk_size = action_chunk_size
         self.open_loop_horizon = open_loop_horizon  # GR00T-specific: execute fewer than full chunk
+        assert open_loop_horizon <= action_chunk_size, "open_loop_horizon must be <= action_chunk_size"
         self.episode_step = 0
         # RTC config
         self.use_rtc = use_rtc
@@ -928,7 +929,7 @@ class TrossenGR00TBridge:
                 events["exit_early"] = False
                 if self.clip_teleop:
                     self._clip_discard()
-                if dataset is not None:
+                if dataset is not None and dataset.episode_buffer is not None:
                     dataset.clear_episode_buffer()
                 continue
 
