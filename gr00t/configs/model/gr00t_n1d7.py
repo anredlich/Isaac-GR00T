@@ -59,6 +59,7 @@ class Gr00tN1d7Config(PretrainedConfig):
 
     random_rotation_angle: int | None = None
     color_jitter_params: dict[str, float] | None = None
+    crop_cameras: dict[str, int] | None = None
     use_albumentations_transforms: bool = True
     # Extra augmentation config (mask-based and others).
     extra_augmentation_config: dict | None = None

@@ -91,6 +91,7 @@ if __name__ == "__main__":
     config.model.state_dropout_prob = ft_config.state_dropout_prob
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
+    config.model.crop_cameras = ft_config.crop_cameras    
     if ft_config.extra_augmentation_config:
         config.model.extra_augmentation_config = json.loads(ft_config.extra_augmentation_config)
     else:

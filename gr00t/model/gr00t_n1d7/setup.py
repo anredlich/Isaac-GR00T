@@ -160,6 +160,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 image_target_size=self.model_config.image_target_size,
                 random_rotation_angle=self.model_config.random_rotation_angle,
                 color_jitter_params=self.model_config.color_jitter_params,
+                crop_cameras=self.model_config.crop_cameras,
                 model_name=self.model_config.model_name,
                 model_type=self.model_config.backbone_model_type,
                 formalize_language=self.model_config.formalize_language,
@@ -188,6 +189,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 image_target_size=self.model_config.image_target_size,
                 random_rotation_angle=self.model_config.random_rotation_angle,
                 color_jitter_params=self.model_config.color_jitter_params,
+                crop_cameras=self.model_config.crop_cameras,
                 model_name=self.model_config.model_name,
                 model_type=self.model_config.backbone_model_type,
                 formalize_language=self.model_config.formalize_language,
@@ -213,6 +215,11 @@ class Gr00tN1d7Pipeline(ModelPipeline):
         if get_rank() == 0:
             with open(self.save_cfg_dir / "final_processor_config.json", "w") as f:
                 json.dump({k: str(v) for k, v in vars(processor).items()}, f, indent=2)
+
+        # Force crop_cameras onto the processor: AutoProcessor.from_pretrained silently
+        # drops unrecognized override kwargs, so set it explicitly to guarantee it takes effect.
+        processor.crop_cameras = self.model_config.crop_cameras or {}
+        logging.info(f"[crop] processor.crop_cameras = {processor.crop_cameras}")
 
         self.processor = processor
         dataset_factory = DatasetFactory(config=self.config)

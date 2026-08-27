@@ -79,6 +79,17 @@ class FinetuneConfig:
 
     If None, applying the default color jitter augmentation from the pretrained model.
     """
+
+    crop_cameras: dict[str, int] | None = None
+    """
+    Per-camera center-square crop applied BEFORE the letterbox/resize pipeline.
+    Dict maps a camera-name substring to a crop size in pixels, e.g.
+    {"cam_left_wrist": 320, "cam_right_wrist": 320, "cam_high": 480, "cam_low": 480}.
+    Substring match: "wrist" matches both wrist cams. Cameras not listed are uncropped.
+    Applied identically at train and inference (persisted in processor_config.json).
+    If None, no cropping (original behavior).
+    """
+
     extra_augmentation_config: str | None = None
     """
     JSON string for extra image augmentations (mask-based and others).

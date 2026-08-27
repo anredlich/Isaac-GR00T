@@ -16,6 +16,8 @@
 from copy import deepcopy
 import json
 import os
+import logging
+logger = logging.getLogger(__name__)
 from pathlib import Path
 import random
 import re
@@ -80,6 +82,36 @@ def build_processor(model_name: str, transformers_loading_kwargs: dict) -> Qwen3
         )
     return Qwen3VLProcessor.from_pretrained(model_name, **transformers_loading_kwargs)
 
+def _center_crop_by_camera(img, view_name, crop_cameras):
+    """Center-square-crop an image if its view matches a crop_cameras pattern.
+    Accepts a PIL.Image or a numpy (H,W,C) array; returns the same type.
+    crop_cameras: dict like {"wrist": 320, "cam_high": 480}. Substring match on view_name.
+    No-op if no pattern matches.
+    """
+    if not crop_cameras:
+        return img
+    size = None
+    for pattern, csz in crop_cameras.items():
+        if pattern in view_name:
+            size = csz
+            break
+    if size is None:
+        return img
+
+    # numpy array path (H, W, C)
+    if hasattr(img, "shape") and not hasattr(img, "crop"):
+        h, w = img.shape[0], img.shape[1]
+        size = min(size, h, w)
+        top = (h - size) // 2
+        left = (w - size) // 2
+        return img[top:top + size, left:left + size, ...]
+
+    # PIL path
+    w, h = img.size  # PIL: (W, H)
+    size = min(size, h, w)
+    left = (w - size) // 2
+    top = (h - size) // 2
+    return img.crop((left, top, left + size, top + size))
 
 class Gr00tN1d7DataCollator:
     def __init__(
@@ -170,6 +202,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         use_mean_std: bool = False,
         # Backward-compat params (stored but not actively used)
         letter_box_transform: bool = False,
+        crop_cameras: dict[str, int] | None = None,
     ):
         self.modality_configs = parse_modality_configs(modality_configs)
 
@@ -221,6 +254,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 self.embodiment_id_mapping[k] = v
         self.shortest_image_edge = shortest_image_edge
         self.crop_fraction = crop_fraction
+        self.crop_cameras = crop_cameras or {}
 
         # Statistics cache (mirrors state_action_processor.statistics for serialization)
         self.statistics: dict[str, dict[str, dict[str, dict[str, list[float]]]]] = {}
@@ -403,11 +437,28 @@ class Gr00tN1d7Processor(BaseProcessor):
         B, T, V, img_H, img_W, img_C = images.shape
 
         if self.use_albumentations:
-            images_flat = images.reshape(B * T * V, img_H, img_W, img_C)
-            pil_images = [Image.fromarray(img.numpy()) for img in images_flat]
+            # Per-view so we can apply camera-specific crops before the shared transform.
+            # images: (B, T, V, H, W, C); flatten order must keep V fastest to match reshape below.
+            _dump = os.environ.get("GR00T_DUMP_IMAGES")
+            _dump_raw, _dump_crop, _dump_view = [], [], []
+            pil_images = []
+            for b in range(B):
+                for t in range(T):
+                    for v_idx, view in enumerate(image_keys):
+                        raw_im = Image.fromarray(images[b, t, v_idx].numpy())
+                        im = raw_im
+                        if self.crop_cameras:
+                            im = _center_crop_by_camera(im, view, self.crop_cameras)
+                        if _dump and b == 0 and t == 0:
+                            _dump_raw.append(raw_im)
+                            _dump_crop.append(im)
+                            _dump_view.append(view)
+                        pil_images.append(im)
             transformed_pil, _ = apply_with_replay(self.eval_image_transform, pil_images)
             transformed_stacked = torch.stack(transformed_pil)  # (B*T*V, C, H_new, W_new)
             _, img_C_new, img_H_new, img_W_new = transformed_stacked.shape
+            if _dump:
+                self._dump_pipeline_images(_dump_raw, _dump_crop, transformed_stacked, _dump_view, _dump)
             transformed_images = transformed_stacked.reshape(
                 B, T * V, img_C_new, img_H_new, img_W_new
             ).numpy()
@@ -619,12 +670,31 @@ class Gr00tN1d7Processor(BaseProcessor):
                     assert view in masks, f"{view} not in masks"
                 view_masks = masks.get(view) if masks else None
                 view_images = images[view]
+                if os.environ.get("GR00T_DUMP_IMAGES") and not hasattr(self, "_dump_done"):
+                    if not hasattr(self, "_dump_buf"):
+                        self._dump_buf = {"raw": [], "crop": [], "final": [], "view": []}
+                    self._dump_buf["raw"].append(view_images[0])
+                if self.crop_cameras:
+                    view_images = [
+                        _center_crop_by_camera(im, view, self.crop_cameras) for im in view_images
+                    ]
 
                 # Apply transforms with replay for consistency
                 transformed_images, replay = apply_with_replay(
                     image_transform, view_images, view_masks, replay
                 )
                 temporal_stacked_images[view] = torch.stack(transformed_images)  # (T, C, H, W)
+                if os.environ.get("GR00T_DUMP_IMAGES") and not hasattr(self, "_dump_done"):
+                    self._dump_buf["crop"].append(view_images[0])
+                    self._dump_buf["final"].append(transformed_images[0])
+                    self._dump_buf["view"].append(view)
+            if os.environ.get("GR00T_DUMP_IMAGES") and not hasattr(self, "_dump_done"):
+                self._dump_done = True
+                self._dump_pipeline_images(
+                    self._dump_buf["raw"], self._dump_buf["crop"],
+                    torch.stack(self._dump_buf["final"]),
+                    self._dump_buf["view"], os.environ["GR00T_DUMP_IMAGES"],
+                )                
         else:
             if masks is not None:
                 raise ValueError(
@@ -653,6 +723,54 @@ class Gr00tN1d7Processor(BaseProcessor):
         vlm_inputs = self._apply_vlm_processing(stacked_images, language)
         return vlm_inputs
 
+    def _dump_pipeline_images(self, raw_list, crop_list, final_stacked, view_list, out_dir):
+        """One-shot debug dump: raw (640x480) -> cropped -> final model input.
+        Gated by env var GR00T_DUMP_IMAGES (=output dir). Saves first (b=0,t=0) frames
+        for each view, then exits if GR00T_DUMP_EXIT is set. Best-effort; never raises.
+        """
+        try:
+            import numpy as _np
+            from PIL import Image as _Image
+            os.makedirs(out_dir, exist_ok=True)
+
+            def _any_to_img(x):
+                # Accept PIL.Image, numpy HWC/CHW, or torch CHW (possibly normalized).
+                if isinstance(x, _Image.Image):
+                    return x
+                if hasattr(x, "detach"):          # torch tensor
+                    a = x.detach().cpu().float().numpy()
+                else:
+                    a = _np.asarray(x)
+                a = _np.squeeze(a)
+                # Move channels-first (C,H,W) with C in {1,3} to channels-last.
+                if a.ndim == 3 and a.shape[0] in (1, 3) and a.shape[2] not in (1, 3):
+                    a = _np.transpose(a, (1, 2, 0))
+                a = a.astype("float32")
+                lo, hi = float(a.min()), float(a.max())
+                if lo < 0.0:                       # ~[-1,1]
+                    a = (a + 1.0) / 2.0 * 255.0
+                elif hi <= 1.0:                    # ~[0,1]
+                    a = a * 255.0
+                # else assume already ~[0,255]
+                a = a.clip(0, 255).astype("uint8")
+                if a.ndim == 2:
+                    a = _np.stack([a] * 3, axis=2)
+                if a.shape[2] == 1:
+                    a = _np.repeat(a, 3, axis=2)
+                return _Image.fromarray(a)
+
+            for i, view in enumerate(view_list):
+                r = _any_to_img(raw_list[i]);  r.save(os.path.join(out_dir, f"{view}_1_raw.png"))
+                c = _any_to_img(crop_list[i]); c.save(os.path.join(out_dir, f"{view}_2_crop.png"))
+                f = _any_to_img(final_stacked[i]); f.save(os.path.join(out_dir, f"{view}_3_final.png"))
+                logger.info(f"[GR00T_DUMP] {view}: raw={r.size} crop={c.size} final={f.size}")
+            logger.info(f"[GR00T_DUMP] saved pipeline images to {out_dir}")
+        except Exception as e:  # never let debugging break a run
+            logger.warning(f"[GR00T_DUMP] failed: {e}")
+        if os.environ.get("GR00T_DUMP_EXIT"):
+            import sys
+            sys.exit(0)
+
     def save_pretrained(self, save_directory: str | Path) -> list[Path]:
         save_directory = Path(save_directory)
         save_directory.mkdir(parents=True, exist_ok=True)
@@ -673,6 +791,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "shortest_image_edge": self.shortest_image_edge,
                 "crop_fraction": self.crop_fraction,
                 "letter_box_transform": self.letter_box_transform,
+                "crop_cameras": self.crop_cameras,
                 # VLM settings
                 "model_name": self.model_name,
                 "model_type": self.model_type,
