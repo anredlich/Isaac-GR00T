@@ -46,6 +46,20 @@ diag = logging.getLogger("diagnostics")
 diag.setLevel(logging.WARNING)  # WARNING by default = INFO calls suppressed
 diag.propagate = True  # Use root handler for output
 
+DISPLAY_CROP = {"cam_left_wrist": 360, "cam_right_wrist": 360, "cam_high": 480, "cam_low": 480}
+
+def _display_crop(img, cam_name, crop_map=DISPLAY_CROP):
+    size = None
+    for pat, csz in crop_map.items():
+        if pat in cam_name:
+            size = csz; break
+    if size is None:
+        return img
+    h, w = img.shape[0], img.shape[1]
+    size = min(size, h, w)
+    top, left = (h - size) // 2, (w - size) // 2
+    return img[top:top + size, left:left + size, ...]
+
 class TrossenGR00TBridge:
     """Bridge between a Trossen AI Stationary Kit and GR00T policy server."""
 
@@ -65,6 +79,7 @@ class TrossenGR00TBridge:
         rtc_frozen_steps: int = 2,
         rtc_ramp_rate: float = 15.0,
         action_smooth_alpha: float = 1.0,
+        display_crop: bool = False,
     ):        
         """
         ...
@@ -82,6 +97,7 @@ class TrossenGR00TBridge:
 
         self.adjust_for_sim_to_real = adjust_for_sim_to_real
         self.display = True
+        self.display_crop = display_crop
 
         logger.info(f"Connecting to GR00T policy server at {policy_server_host}:{policy_server_port}")
         # GR00T uses ZMQ-based PolicyClient (vs openpi's WebSocket)
@@ -348,7 +364,9 @@ class TrossenGR00TBridge:
                 observation_dict = self.robot.capture_observation()
                 for cam in camera_features:
                     image_hwc = observation_dict[cam].numpy()
-                    cv2.imshow(cam, cv2.cvtColor(image_hwc, cv2.COLOR_RGB2BGR))
+                    #cv2.imshow(cam, cv2.cvtColor(image_hwc, cv2.COLOR_RGB2BGR))
+                    disp = _display_crop(image_hwc, cam) if self.display_crop else image_hwc
+                    cv2.imshow(cam, cv2.cvtColor(disp, cv2.COLOR_RGB2BGR))
                     cv2.waitKey(1)
 
             # Request new action chunk after consuming the previous one
@@ -493,6 +511,8 @@ if __name__ == "__main__":
                          "Do NOT use 0.0 (would freeze robot).")
     parser.add_argument("--diagnostics", action="store_true",
                         help="Enable diagnostic logging (RTC freeze checks, action deltas, etc.)")
+    parser.add_argument("--display_crop", action="store_true",
+                    help="Show center-cropped camera views (display only; model still gets full frames)")    
     args = parser.parse_args()
 
     # Enable diagnostics logging if requested
@@ -515,6 +535,7 @@ if __name__ == "__main__":
         rtc_frozen_steps=args.rtc_frozen_steps,
         rtc_ramp_rate=args.rtc_ramp_rate,
         action_smooth_alpha=args.action_smooth_alpha,
+        display_crop=args.display_crop,
     )
 
     bridge.autonomous_mode(task_prompt=args.task_prompt)
