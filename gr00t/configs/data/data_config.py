@@ -75,6 +75,10 @@ class DataConfig:
     # Override statistics from the pretrained checkpoint
     override_pretraining_statistics: bool = True
 
+    # Global indices to widen degenerate (frozen-joint) normalization bands.
+    # None/empty = off. e.g. [0,1,2,3,4,5,6] = left arm+gripper for Trossen bimanual.
+    frozen_dims: Optional[List[int]] = None
+    
     # General task / mode config (shared across datasets)
     mode: str = "single_turn"
     random_chop: float = 0.0

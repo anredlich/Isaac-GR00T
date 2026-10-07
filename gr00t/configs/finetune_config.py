@@ -172,3 +172,7 @@ class FinetuneConfig:
     """If True, skip loading model weights from base_model_path (architecture only).
     The processor (tokenizer/config) is still loaded from base_model_path.
     Useful for CI/testing to skip the slow checkpoint shard loading."""
+
+    frozen_dims: list[int] | None = None
+    """Global action/state indices whose frozen-joint normalization bands are widened
+    to mean ± 0.5 (prevents sensor-jitter blowup). None = off. e.g. 0 1 2 3 4 5 6."""

@@ -126,5 +126,6 @@ if __name__ == "__main__":
 
     config.training.save_only_model = ft_config.save_only_model
     config.training.skip_weight_loading = ft_config.skip_weight_loading
+    config.data.frozen_dims = ft_config.frozen_dims
 
     run(config)

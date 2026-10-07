@@ -15,6 +15,7 @@
 
 from concurrent.futures import Future, ThreadPoolExecutor
 import time
+import logging
 
 import numpy as np
 import torch.distributed as dist
@@ -22,6 +23,53 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from gr00t.data.interfaces import BaseProcessor, ShardedDataset
 
+def _patch_frozen_dims(global_stats, frozen_dims=None, half_width=0.5):
+    """Widen normalization bands for explicitly-specified frozen joint dims.
+
+    A non-moving joint has q99-q01 ~ 0; robust min-max normalization would stretch
+    its sensor jitter across [-1,1], injecting irreducible noise into the action loss
+    and the state input. For each listed dim, re-center its band on that dim's mean
+    with a fixed half-width, so the constant value normalizes to ~0 and un-normalizes
+    back to the true parked pose.
+
+    frozen_dims are GLOBAL indices into the concatenated vector (e.g. 0-6 = left
+    arm+gripper for the Trossen bimanual layout), applied to BOTH action and state.
+    Groups are walked in modality_keys order, mapping each group's slice to global
+    indices. Off by default: empty/None returns global_stats unchanged.
+    """
+    if not frozen_dims:
+        return global_stats
+
+    want = set(frozen_dims)
+    for emb, mods in global_stats.items():
+        for modality in ("action", "state"):
+            if modality not in mods:
+                continue
+            offset = 0
+            for group_key, s in mods[modality].items():
+                n = len(s["q01"])
+                local = [i for i in range(n) if (offset + i) in want]
+                if local:
+                    q01  = np.asarray(s["q01"],  dtype=float)
+                    q99  = np.asarray(s["q99"],  dtype=float)
+                    mean = np.asarray(s["mean"], dtype=float)
+                    for i in local:
+                        q01[i] = mean[i] - half_width
+                        q99[i] = mean[i] + half_width
+                    s["q01"], s["q99"] = q01.tolist(), q99.tolist()
+                    if "min" in s and "max" in s:
+                        mn = np.asarray(s["min"], dtype=float)
+                        mx = np.asarray(s["max"], dtype=float)
+                        for i in local:
+                            mn[i] = min(mn[i], mean[i] - half_width)
+                            mx[i] = max(mx[i], mean[i] + half_width)
+                        s["min"], s["max"] = mn.tolist(), mx.tolist()
+                    logging.info(
+                        f"[frozen-dim patch] {emb}/{modality}/{group_key}: "
+                        f"widened local dims {local} (global offset {offset}) to mean ± {half_width}"
+                    )
+                offset += n
+    return global_stats
 
 def merge_statistics(
     per_dataset_stats: list[dict[str, dict[str, list[float] | np.ndarray]]],
@@ -172,6 +220,7 @@ class ShardedMixtureDataset(IterableDataset):
         training: bool = True,
         num_shards_per_epoch: int = int(1e5),
         override_pretraining_statistics: bool = False,
+        frozen_dims: list[int] | None = None,
     ):
         """Initialize mixture dataset with datasets, weights, and configuration."""
         self.datasets = datasets
@@ -182,6 +231,7 @@ class ShardedMixtureDataset(IterableDataset):
         self.epoch = 0
         self.processor = processor
         self.override_pretraining_statistics = override_pretraining_statistics
+        self.frozen_dims = frozen_dims
 
         # Generate initial shard sampling schedule
         self.shard_sampling_schedule = self.generate_shard_sampling_schedule()
@@ -242,6 +292,7 @@ class ShardedMixtureDataset(IterableDataset):
 
         # Configure processor and datasets with merged statistics
         self.global_stats = stats_by_emb
+        self.global_stats = _patch_frozen_dims(self.global_stats, self.frozen_dims)
         self.processor.set_statistics(
             self.global_stats, override=self.override_pretraining_statistics
         )
